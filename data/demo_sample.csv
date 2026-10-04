@@ -1,0 +1,31 @@
+id,platform,source,date,text,political_bloc,manual_sentiment
+1,YouTube,DEMO - GMA News recap,2025-02-05,"Sumusuporta ako kay VP Sara, due process muna bago husga. #DueProcess",Pro-Duterte,Positive
+2,YouTube,DEMO - GMA News recap,2025-02-05,"Dapat managot kung may anomalya sa confidential funds!!!",Pro-Accountability,Negative
+3,YouTube,DEMO - Inquirer explainer,2025-02-06,"Hindi ko pa alam ang facts, hintay muna tayo ng trial.",Undecided/Neutral,Neutral
+4,Reddit,DEMO - r/Philippines thread,2025-02-06,"The impeachment complaint seems politically motivated tbh, kawawa ang bayan.",Pro-Duterte,Positive
+5,Reddit,DEMO - r/Philippines thread,2025-02-06,"Impeachment is accountability, hindi ito persecution. Let the evidence speak.",Pro-Accountability,Negative
+6,Reddit,DEMO - r/Philippines thread,2025-02-07,"Neutral ako dito, basahin muna natin ang articles of impeachment.",Undecided/Neutral,Neutral
+7,Facebook (imported),DEMO - manual copy,2025-02-07,"Grabe ang confidential funds issue, nakakadismaya :(",Pro-Accountability,Negative
+8,Facebook (imported),DEMO - manual copy,2025-02-07,"Solid DDS forever! Laban VP Sara 💪💪💪",Pro-Duterte,Positive
+9,X (imported),DEMO - manual copy,2025-02-08,"Impeach na yan, ubos na pasensya ng taumbayan!!! Sobrang corrupt na.",Pro-Accountability,Negative
+10,X (imported),DEMO - manual copy,2025-02-08,"Wag magpadala sa fake news, verify muna pls.",Undecided/Neutral,Neutral
+11,YouTube,DEMO - ANC interview,2025-02-09,"I love how she handled the presscon, very presidential, nakakaproud!",Pro-Duterte,Positive
+12,YouTube,DEMO - ANC interview,2025-02-09,"Sinungaling! harapin ang COA findings, wag puro drama.",Pro-Accountability,Negative
+13,Reddit,DEMO - r/NewsPH thread,2025-02-09,"Can someone ELI5 the impeachment process? Di ko gets ang steps.",Undecided/Neutral,Neutral
+14,News site (imported),DEMO - manual copy,2025-02-10,"Opposition lawmakers say the complaint has strong documentary backing.",Pro-Accountability,Negative
+15,News site (imported),DEMO - manual copy,2025-02-10,"Allies call it harassment and urge the public to stay calm.",Pro-Duterte,Positive
+16,Facebook (imported),DEMO - manual copy,2025-02-10,"Neutral lang po, ayoko makipag-away sa comments.",Undecided/Neutral,Neutral
+17,YouTube,DEMO - GMA News recap,2025-02-11,"Hindi ako sang-ayon sa impeachment, masyadong divisive sa bansa.",Pro-Duterte,Positive
+18,X (imported),DEMO - manual copy,2025-02-11,"Accountability is not political persecution. #ImpeachSara",Pro-Accountability,Negative
+19,Reddit,DEMO - r/Philippines thread,2025-02-11,"Mixed feelings, may point ang both sides tbh.",Undecided/Neutral,Neutral
+20,YouTube,DEMO - Inquirer explainer,2025-02-12,"Mabuhay ang hustisya! Dapat imbestigahan ng Senate.",Pro-Accountability,Negative
+21,Facebook (imported),DEMO - manual copy,2025-02-12,"Protect VP Sara at all costs, hindi siya nag-iisa!!",Pro-Duterte,Positive
+22,News site (imported),DEMO - manual copy,2025-02-12,"Legal experts are divided on whether the complaint will prosper.",Undecided/Neutral,Neutral
+23,X (imported),DEMO - manual copy,2025-02-13,"Nakakahiya ang gobyerno, puro away, walang trabaho. Smh.",Pro-Accountability,Negative
+24,Reddit,DEMO - r/NewsPH thread,2025-02-13,"Duterte supporters are delusional, evidence is right there lol — charot, pero seryoso.",Pro-Accountability,Negative
+25,YouTube,DEMO - ANC interview,2025-02-13,"Sana manaig ang katotohanan at due process para sa lahat.",Undecided/Neutral,Neutral
+26,Facebook (imported),DEMO - manual copy,2025-02-14,"Hindi totoo ang paratang, gawa-gawa lang ng kalaban!",Pro-Duterte,Positive
+27,X (imported),DEMO - manual copy,2025-02-14,"Trial by publicity na naman, hay nako Pilipinas.",Undecided/Neutral,Neutral
+28,News site (imported),DEMO - manual copy,2025-02-14,"Youth groups stage rally calling for transparency on funds.",Pro-Accountability,Negative
+29,Reddit,DEMO - r/Philippines thread,2025-02-15,"I stand with Sara, she did so much for DepEd kahit may issues.",Pro-Duterte,Positive
+30,YouTube,DEMO - GMA News recap,2025-02-15,"Ewan ko, magulo, observahan na lang muna natin.",Undecided/Neutral,Neutral

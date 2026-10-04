@@ -1,0 +1,41 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env/
+
+# --- App runtime output (regenerated via sidebar Save / notes) ---
+saved_state/*
+!saved_state/.gitkeep
+
+# --- OS / editors ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# --- Agentic AI instruction / config files ---
+# Ignore local AI-agent configs so personal agent setups never get committed.
+AGENTS.md
+AGENT.md
+CLAUDE.md
+CLAUDE.local.md
+.cursorrules
+.muserules
+.windsurfrules
+.aider*
+aider.*
+ CONTINUE*
+opencode.json
+opencode.jsonc
+opencode.yaml
+.opencode/
+.cursor/
+.codex/
+.claude/
+.continue/
+.avante/
+.augment/
+copilot-instructions.md
