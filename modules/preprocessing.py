@@ -21,10 +21,27 @@ Design note: we use a light regex tokenizer + rule maps instead of a heavy
 dependency so behavior is transparent and explainable in a defense. NLTK is
 used for the English stopword list (with a built-in fallback if the NLTK
 data download is missing).
+
+Dual-track design (see Main_obj.md workflow):
+  Track A (LDA / TF-IDF): full cleaning below -> clean_text + tokens
+    (stopwords removed, slang normalized). Bag-of-words models need this.
+  Track B (transformer / VADER comparison): light_clean() -> text_light
+    (URLs/mentions stripped, case kept simple, NO stopword removal, NO slang
+    collapsing). Contextual models need the original wording, including
+    negations like 'hindi' and intensifiers like 'sobra'.
+
+Stopword sources (priority order):
+  1. `stopwordsiso` pip package: stopwords("tl") + stopwords("en")
+     (stopwords-iso / stopwords-tl, MIT).
+  2. Vendored data/stopwords_tl.txt (+ NLTK English) for offline use.
+  3. Built-in FILIPINO_STOPWORDS + NLTK fallback below.
+Slang map: data/taglish_slang.csv if present, else TAGLISH_SLANG.
 """
 
 import re
 from collections import Counter
+from functools import lru_cache
+from pathlib import Path
 
 import pandas as pd
 
@@ -79,13 +96,20 @@ FILIPINO_STOPWORDS = {
 
 
 def get_english_stopwords() -> set:
-    """English stopwords via NLTK, with a built-in fallback list.
+    """English stopwords: stopwordsiso(en) -> NLTK -> built-in fallback.
 
     We try nltk.corpus.stopwords; if the NLTK data pack was never
     downloaded (offline machine), we fall back to a compact built-in set
     so the app still runs — and the GUI tells the student to run the
     nltk.download lines from the README.
     """
+    try:
+        from stopwordsiso import stopwords as iso_stopwords
+        words = set(iso_stopwords("en"))
+        if words:
+            return words
+    except Exception:
+        pass
     try:
         from nltk.corpus import stopwords as nltk_sw
         return set(nltk_sw.words("english"))
@@ -110,8 +134,73 @@ def get_english_stopwords() -> set:
         }
 
 
+def get_tagalog_stopwords() -> tuple:
+    """Tagalog stopwords from stopwordsiso('tl'), with offline fallbacks.
+
+    Returns (words, source_name) where source_name is one of
+    'stopwordsiso:tl', 'vendored:data/stopwords_tl.txt', 'builtin'.
+    """
+    try:
+        from stopwordsiso import stopwords as iso_stopwords
+        words = {w.strip().lower() for w in iso_stopwords("tl") if w.strip()}
+        if words:
+            return words, "stopwordsiso:tl"
+    except Exception:
+        pass
+    for cand in [Path("data/stopwords_tl.txt"),
+                 Path(__file__).resolve().parent.parent / "data" /
+                 "stopwords_tl.txt"]:
+        try:
+            if cand.exists():
+                words = {ln.strip().lower() for ln in
+                         cand.read_text(encoding="utf-8").splitlines()
+                         if ln.strip() and not ln.strip().startswith("#")}
+                if words:
+                    return words, "vendored:data/stopwords_tl.txt"
+        except Exception:
+            continue
+    return set(FILIPINO_STOPWORDS), "builtin"
+
+
+def stopwords_source() -> str:
+    """Human-readable stopword provenance for the GUI/remarks table."""
+    try:
+        tl, tl_src = get_tagalog_stopwords()
+    except Exception:
+        return "builtin (fallback)"
+    try:
+        from stopwordsiso import stopwords as iso_stopwords
+        en = set(iso_stopwords("en"))
+        en_src = "stopwordsiso:en" if en else "nltk/builtin"
+    except Exception:
+        en_src = "nltk/builtin"
+    return f"tl={tl_src} ({len(tl)} words) + en={en_src}"
+
+
+@lru_cache(maxsize=1)
+def get_slang_map() -> dict:
+    """Slang map: data/taglish_slang.csv if present, else TAGLISH_SLANG."""
+    for cand in [Path("data/taglish_slang.csv"),
+                 Path(__file__).resolve().parent.parent / "data" /
+                 "taglish_slang.csv"]:
+        try:
+            if cand.exists():
+                df = pd.read_csv(cand)
+                cols = {str(c).lower(): c for c in df.columns}
+                if "variant" in cols and "canonical" in cols:
+                    m = {str(v).strip().lower(): str(c).strip().lower()
+                         for v, c in
+                         zip(df[cols["variant"]], df[cols["canonical"]])
+                         if str(v).strip()}
+                    if m:
+                        return m
+        except Exception:
+            continue
+    return dict(TAGLISH_SLANG)
+
+
 def get_default_stopwords(custom_extra=None) -> set:
-    """Union of English + Filipino + optional custom stopwords.
+    """Union of English + Tagalog + optional custom stopwords.
 
     IMPORTANT: negation words ('hindi', 'not', ...) and intensifiers
     ('sobra', 'very', ...) are REMOVED from the stopword set even if they
@@ -119,7 +208,8 @@ def get_default_stopwords(custom_extra=None) -> set:
     those tokens to flip/amplify scores (see sentiment.py). Dropping them
     here would silently disable negation handling.
     """
-    base = set(get_english_stopwords()) | set(FILIPINO_STOPWORDS)
+    tl_words, _src = get_tagalog_stopwords()
+    base = set(get_english_stopwords()) | set(tl_words)
     try:
         from modules.sentiment import INTENSIFIERS, NEGATIONS
         base -= set(NEGATIONS) | {k.lower() for k in INTENSIFIERS}
@@ -171,9 +261,24 @@ def clean_single_text(text: str, stopwords: set,
     t = collapse_repeats(t)
     # Normalize slang token-by-token (word boundaries).
     words = WORD_RE.findall(t)
-    words = [TAGLISH_SLANG.get(w, w) for w in words]
+    words = [get_slang_map().get(w, w) for w in words]
     words = [w for w in words if w not in stopwords and len(w) > 1]
     return " ".join(words), words
+
+
+def light_clean(text: str) -> str:
+    """Track-B cleaning for transformer/VADER input (context preserved).
+
+    Only strips URLs and @mentions, collapses whitespace, and trims. Keeps
+    stopwords, slang spellings, casing-neutralized text and emojis intact so
+    contextual models see negations ('hindi'), intensifiers ('sobra') and
+    emphasis. Use this column for HF inference, NOT clean_text.
+    """
+    t = str(text or "")
+    t = URL_RE.sub(" ", t)
+    t = MENTION_RE.sub(" @user ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
 
 
 # ---------------------------------------------------------------------------
@@ -191,7 +296,10 @@ def preprocess_dataframe(df: pd.DataFrame, custom_stopwords=None,
         min_tokens: drop rows with fewer tokens after cleaning.
 
     Returns:
-        df_clean: copy of df + ['clean_text', 'tokens'] for kept rows.
+        df_clean: copy of df + ['clean_text', 'tokens', 'text_light'].
+            text_light is the Track-B input for transformer/VADER (raw text
+            with only URLs/mentions stripped). Rows are filtered on Track-A
+            quality (clean_text non-empty, >= min_tokens).
         log: [(step, n_rows)] counts for the funnel chart/table.
         freq: DataFrame(word, count) sorted desc for the frequency chart.
     """
@@ -213,6 +321,9 @@ def preprocess_dataframe(df: pd.DataFrame, custom_stopwords=None,
         tok_lists.append(toks)
     work["clean_text"] = cleaned
     work["tokens"] = tok_lists
+    # Track B: light cleaning on the ORIGINAL text (before filtering), kept
+    # aligned so transformer inference never sees stopword-stripped input.
+    work["text_light"] = work["text"].astype(str).apply(light_clean)
     work = work[work["clean_text"].str.strip() != ""].copy()
     log.append(("2. After cleaning (non-empty result)", len(work)))
     # De-duplicate on clean_text (catches copy-paste spam across platforms).
