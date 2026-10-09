@@ -122,9 +122,12 @@ def tip(term: str, definition: str) -> None:
 # ---------------------------------------------------------------------------
 def _state_to_jsonable(state: dict) -> dict:
     """Convert session values to JSON-safe types (skip DataFrames)."""
+    # Recomputable / non-serializable live objects: never persist (a str()
+    # snapshot would restore as a useless string and crash `.items()`).
+    SKIP_KEYS = {"distinctive", "topic_reps", "lda_model"}
     out = {}
     for k, v in state.items():
-        if k.startswith("_"):
+        if k.startswith("_") or k in SKIP_KEYS:
             continue
         if isinstance(v, pd.DataFrame):
             continue  # DataFrames saved separately as CSV
@@ -149,11 +152,21 @@ def save_state() -> str:
     snap["_saved_at"] = ts
     with open(os.path.join(SAVE_DIR, "state.json"), "w", encoding="utf-8") as f:
         json.dump(snap, f, ensure_ascii=False, indent=2)
-    # CSV parts
-    for key in ["df_raw", "df_clean", "sentiment_df", "error_df"]:
+    # CSV parts (datasets + computed result artifacts so reopen is instant).
+    # cos/jac/share matrices are symmetric group x group: keep the row-label
+    # index (plain to_csv would replace it with 0,1,2 on reload and break
+    # the pair-badge loop).
+    INDEXED_KEYS = {"cos_df", "jac_df", "topic_share"}
+    for key in ["df_raw", "df_clean", "sentiment_df", "hf_df", "error_df",
+                "cos_df", "jac_df", "shared_df", "k_table", "topic_words",
+                "topic_share"]:
         df = st.session_state.get(key)
         if isinstance(df, pd.DataFrame) and not df.empty:
-            df.to_csv(os.path.join(SAVE_DIR, f"{key}.csv"), index=False)
+            p = os.path.join(SAVE_DIR, f"{key}.csv")
+            if key in INDEXED_KEYS:
+                df.to_csv(p, index_label="group")
+            else:
+                df.to_csv(p, index=False)
     # Lexicon / stopwords explicitly (may be DataFrame or list)
     lex = st.session_state.get("lexicon_df")
     if isinstance(lex, pd.DataFrame) and not lex.empty:
@@ -172,13 +185,72 @@ def load_state() -> str:
         if k == "_saved_at":
             continue
         st.session_state[k] = v
-    for key in ["df_raw", "df_clean", "sentiment_df", "error_df"]:
+    for key in ["df_raw", "df_clean", "sentiment_df", "hf_df", "error_df",
+                "cos_df", "jac_df", "shared_df", "k_table", "topic_words",
+                "topic_share"]:
         p = os.path.join(SAVE_DIR, f"{key}.csv")
         if os.path.exists(p):
             try:
-                st.session_state[key] = pd.read_csv(p)
+                if key in ("cos_df", "jac_df", "topic_share"):
+                    st.session_state[key] = pd.read_csv(p, index_col=0)
+                else:
+                    st.session_state[key] = pd.read_csv(p)
             except Exception:
                 pass
+    # Repair: list-columns (tokens) come back from CSV as strings.
+    for key in ["df_clean", "sentiment_df"]:
+        df = st.session_state.get(key)
+        if isinstance(df, pd.DataFrame) and not df.empty and \
+                "tokens" in df.columns and "clean_text" in df.columns:
+            try:
+                if not isinstance(df["tokens"].iloc[0], list):
+                    df["tokens"] = df["clean_text"].astype(str).str.split()
+                    st.session_state[key] = df
+            except Exception:
+                pass
+    # Repair: all-empty label columns come back from CSV as float64, which
+    # makes pandas 3 refuse string assignment (LossySetitemError) in the
+    # labeling tool. Force them back to nullable-string semantics.
+    for key in ["df_raw", "df_clean", "sentiment_df", "hf_df"]:
+        df = st.session_state.get(key)
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            try:
+                if "manual_sentiment" in df.columns:
+                    df["manual_sentiment"] = df["manual_sentiment"] \
+                        .fillna("").astype("string")
+                if "political_bloc" in df.columns:
+                    df["political_bloc"] = df["political_bloc"] \
+                        .fillna("Undecided/Neutral").astype("string")
+                st.session_state[key] = df
+            except Exception:
+                pass
+    # Repair: JSON turns topic label keys into strings; re-key to int, and
+    # coerce restored assignments to (int, float) tuples.
+    try:
+        tl = st.session_state.get("topic_labels")
+        if isinstance(tl, dict):
+            st.session_state["topic_labels"] = {
+                int(k): v for k, v in tl.items()}
+    except Exception:
+        pass
+    try:
+        ta = st.session_state.get("topic_assign")
+        if isinstance(ta, list):
+            st.session_state["topic_assign"] = [
+                (int(t), float(p)) for t, p in ta]
+    except Exception:
+        pass
+    # Restore stage flags implied by present artifacts.
+    if isinstance(st.session_state.get("df_raw"), pd.DataFrame):
+        st.session_state["stage_collection_done"] = True
+    if isinstance(st.session_state.get("df_clean"), pd.DataFrame):
+        st.session_state["stage_preprocessing_done"] = True
+    if isinstance(st.session_state.get("cos_df"), pd.DataFrame):
+        st.session_state["stage_similarity_done"] = True
+    if isinstance(st.session_state.get("topic_words"), pd.DataFrame):
+        st.session_state["stage_topics_done"] = True
+    if isinstance(st.session_state.get("sentiment_df"), pd.DataFrame):
+        st.session_state["stage_sentiment_done"] = True
     lex_p = os.path.join(SAVE_DIR, "lexicon.csv")
     if os.path.exists(lex_p):
         try:
