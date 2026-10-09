@@ -27,7 +27,9 @@ DATA MINING/
 │   ├── evaluation.py       # Holdout lock, 10-fold CV, metrics, error table.
 │   └── glossary.py         # 30+ terms: definition, example, formula, how-to-read.
 ├── data/
-│   └── demo_sample.csv     # 30-row DEMO set (clearly marked, testing only).
+│   ├── raw_data.csv        # webscraped dataset (~2751 rows, X/YouTube/Facebook)
+│   ├── stopwords_tl.txt    # vendored Tagalog stopwords (offline fallback for stopwordsiso)
+│   └── taglish_slang.csv   # editable slang map (variant → canonical)
 └── saved_state/            # Save/Load output (state.json, CSVs, my_notes.txt).
 ```
 
