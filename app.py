@@ -28,12 +28,13 @@ import streamlit as st
 # Make "modules/" importable whether launched from repo root or elsewhere.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from config import DEFAULT_THRESHOLDS, THRESHOLD_HELP  # noqa: E402
+from config import DEFAULT_THRESHOLDS, HF_DEFAULTS, THRESHOLD_HELP  # noqa: E402
 from modules import data_collection as DC  # noqa: E402
 from modules import preprocessing as PP  # noqa: E402
 from modules import similarity as SIM  # noqa: E402
 from modules import topics as TOP  # noqa: E402
 from modules import sentiment as SEN  # noqa: E402
+from modules import sentiment_hf as SHF  # noqa: E402
 from modules import evaluation as EV  # noqa: E402
 from modules import glossary as GLO  # noqa: E402
 from modules.helpers import (analysis_helper_box, is_unlocked, load_state,
@@ -79,6 +80,12 @@ def init_state():
         "topic_assign": None,      # dominant topic per doc
         "k_table": None, "coherence_best": None,
         "my_notes": "",
+        "hf_model_id": HF_DEFAULTS["model_id"],
+        "hf_batch_size": HF_DEFAULTS["batch_size"],
+        "hf_df": None,               # transformer comparison predictions
+        "hf_device": None,           # device string from last HF run
+        "hf_fp": None,               # cache fingerprint of last HF run
+        "hf_cached": None,           # True if last HF run loaded from disk
         "stage_collection_done": False,
         "stage_preprocessing_done": False,
         "stage_similarity_done": False,
@@ -93,6 +100,52 @@ def init_state():
 
 init_state()
 TH = st.session_state["thresholds"]  # shortcut, always the LIVE edited dict
+
+
+# ---------------------------------------------------------------------------
+# Auto-boot: raw_data.csv is the dataset — no manual collection needed.
+# On every fresh session: silently resume saved results if present, else
+# load raw_data.csv and preprocess immediately so all pages show results.
+# ---------------------------------------------------------------------------
+def auto_boot():
+    """Load data + preprocessing without asking; cheap stages run now."""
+    if st.session_state.get("_booted"):
+        return
+    st.session_state["_booted"] = True
+    # 1. Resume previous run (instant results on reopen).
+    try:
+        if os.path.exists(os.path.join("saved_state", "state.json")) and \
+                st.session_state.get("df_raw") is None:
+            load_state()
+    except Exception:
+        pass
+    # 2. No saved state: load the webscraped dataset directly.
+    if st.session_state.get("df_raw") is None:
+        try:
+            with st.spinner("Loading raw_data.csv (first open only)…"):
+                st.session_state["df_raw"] = DC.load_raw_data_csv()
+            st.session_state["demo_mode"] = False
+            st.session_state["stage_collection_done"] = True
+        except Exception as e:
+            st.error(f"Could not auto-load data/raw_data.csv: {e}")
+            return
+    # 3. Preprocess immediately (fast) so every page has results.
+    if st.session_state.get("df_clean") is None and \
+            isinstance(st.session_state.get("df_raw"), pd.DataFrame):
+        try:
+            with st.spinner("Preprocessing 2,742 comments (first open only)…"):
+                clean, log, freq = PP.preprocess_dataframe(
+                    st.session_state["df_raw"], custom_stopwords=[],
+                    map_emojis=True, min_tokens=3)
+            st.session_state["df_clean"] = clean
+            st.session_state["freq_table"] = freq
+            st.session_state["prep_log"] = log
+            st.session_state["stage_preprocessing_done"] = True
+        except Exception as e:
+            st.error(f"Auto-preprocessing failed: {e}")
+
+
+auto_boot()
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +201,74 @@ def df_raw():
     return d if isinstance(d, pd.DataFrame) else pd.DataFrame()
 
 
+def sync_labels_from_raw():
+    """Carry fresh human labels from df_raw into derived frames (by id).
+
+    Label buttons edit df_raw only; pages 6-7 read df_clean/sentiment_df
+    snapshots. Without this sync, new labels never reach validation.
+    Predictions are untouched (they don't depend on labels).
+    """
+    raw = st.session_state.get("df_raw")
+    if raw is None or getattr(raw, "empty", True):
+        return
+    for key in ["df_clean", "sentiment_df", "hf_df"]:
+        df = st.session_state.get(key)
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            try:
+                st.session_state[key] = DC.propagate_labels(raw, df)
+            except Exception:
+                pass
+
+
+def labeled_count() -> int:
+    """Number of human-labeled rows in df_raw (0-safe)."""
+    d = st.session_state.get("df_raw")
+    if not isinstance(d, pd.DataFrame) or d.empty \
+            or "manual_sentiment" not in d.columns:
+        return 0
+    return int(d["manual_sentiment"].isin(EV.LABELS).sum())
+
+
+def save_labels_now() -> bool:
+    """Persist the session to disk; stamp the time for visible proof."""
+    try:
+        save_state()
+        from datetime import datetime
+        st.session_state["labels_saved_at"] = datetime.now().strftime(
+            "%H:%M:%S")
+        return True
+    except Exception as e:
+        st.warning(f"Auto-save failed (labels kept in memory): {e}")
+        return False
+
+
+def invalidate_downstream_keep_clean():
+    """Preprocessing re-ran: keep the new clean table, void the rest."""
+    for k in ["sentiment_df", "hf_df",
+              "cos_df", "jac_df", "shared_df", "distinctive", "sim_group",
+              "sim_maxfeat", "dev_df", "hold_df", "cv_df", "final_res",
+              "error_df", "topic_assign", "k_table", "topic_words",
+              "topic_reps", "topic_share"]:
+        st.session_state[k] = None
+    for k in ["stage_similarity_done", "stage_topics_done",
+              "stage_sentiment_done", "stage_validation_done"]:
+        st.session_state[k] = False
+
+
+def invalidate_downstream():
+    """New/edited raw data voids every computed result; pages recompute."""
+    for k in ["df_clean", "freq_table", "prep_log", "sentiment_df", "hf_df",
+              "cos_df", "jac_df", "shared_df", "distinctive", "sim_group",
+              "sim_maxfeat", "dev_df", "hold_df", "cv_df", "final_res",
+              "error_df", "topic_assign", "k_table", "topic_words",
+              "topic_reps", "topic_share"]:
+        st.session_state[k] = None
+    for k in ["stage_preprocessing_done", "stage_similarity_done",
+              "stage_topics_done", "stage_sentiment_done",
+              "stage_validation_done"]:
+        st.session_state[k] = False
+
+
 def add_rows(new_df: pd.DataFrame, mark_demo=False):
     """Append new rows to df_raw, de-duplicating on text."""
     base = df_raw()
@@ -162,6 +283,17 @@ def add_rows(new_df: pd.DataFrame, mark_demo=False):
     st.session_state["demo_mode"] = bool(mark_demo)
     if len(combined) >= 5:
         st.session_state["stage_collection_done"] = True
+    invalidate_downstream()
+    # Re-preprocess immediately so results stay in sync with the data.
+    try:
+        clean, log, freq = PP.preprocess_dataframe(
+            combined, custom_stopwords=[], map_emojis=True, min_tokens=3)
+        st.session_state["df_clean"] = clean
+        st.session_state["freq_table"] = freq
+        st.session_state["prep_log"] = log
+        st.session_state["stage_preprocessing_done"] = True
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -315,8 +447,8 @@ comment supports; sentiment records how its WORDING sounds. An angry defense of 
         else:
             render_badge("grey", "GREY — metrics pending",
                          "Final one-time eval on page 7.")
-    st.info("💡 Tip: click **page 2** in the sidebar and press **Load DEMO DATA** "
-            "to try every page end-to-end in minutes, then replace it with real data.")
+    st.info("💡 Tip: your **raw_data.csv loads by itself** with results pre-computed — "
+            "open pages 3–6 directly. Only page 7 needs you: label a sample of comments below first.")
 
 
 # ===========================================================================
@@ -419,7 +551,7 @@ this — so the app automates only those two, respecting quotas and rate limits.
                 st.error(str(e))
 
     st.divider()
-    colx, coly = st.columns([1, 1])
+    colx, colm, coly = st.columns([1, 1, 1])
     with colx:
         if st.button("🧪 Load DEMO DATA (30 clearly-marked sample rows)"):
             try:
@@ -429,10 +561,22 @@ this — so the app automates only those two, respecting quotas and rate limits.
                 st.rerun()
             except Exception as e:
                 st.error(f"Demo load failed: {e}")
+    with colm:
+        if st.button("📥 Load raw_data.csv (webscraped, ~2751 rows)"):
+            try:
+                add_rows(DC.load_raw_data_csv(), mark_demo=False)
+                st.session_state["label_idx"] = 0
+                st.success("raw_data.csv loaded (platforms normalized, "
+                           "usernames anonymized). Label a stratified sample "
+                           "below — validation runs on labeled rows only.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"raw_data.csv load failed: {e}")
     with coly:
         if st.button("🗑️ Clear dataset (start over with real data)"):
             for k in ["df_raw", "df_clean", "freq_table", "prep_log", "dev_df",
-                      "hold_df", "cv_df", "final_res", "topic_assign", "k_table"]:
+                      "hold_df", "cv_df", "final_res", "topic_assign", "k_table",
+                      "sentiment_df", "hf_df", "error_df"]:
                 st.session_state[k] = None
             for k in ["stage_collection_done", "stage_preprocessing_done",
                       "stage_similarity_done", "stage_topics_done",
@@ -444,6 +588,11 @@ this — so the app automates only those two, respecting quotas and rate limits.
 
     st.subheader("Live dataset")
     data = df_raw()
+    if not data.empty and not st.session_state.get("demo_mode"):
+        st.success(f"✅ **raw_data.csv auto-loaded: {len(data)} comments** "
+                   f"({', '.join(f'{k} {v}' for k, v in data['platform'].value_counts().items())}). "
+                   "No collection needed — browse the results pages directly. "
+                   "Use the labeling tool below to grade a sample for validation.")
     if data.empty:
         st.info("No data yet — fetch, upload, paste, or load DEMO DATA above.")
     else:
@@ -481,7 +630,17 @@ this — so the app automates only those two, respecting quotas and rate limits.
                         if (edited["source"].str.contains(
                             "DEMO", na=False).sum() == 0) else \
                         st.session_state["demo_mode"]
-                    st.success("Edits applied.")
+                    # Labels changed: validation splits are stale (predictions
+                    # themselves don't depend on labels, so other stages stay).
+                    for k in ["dev_df", "hold_df", "cv_df", "final_res",
+                              "error_df"]:
+                        st.session_state[k] = None
+                    st.session_state["holdout_idx"] = None
+                    st.session_state["stage_validation_done"] = False
+                    sync_labels_from_raw()
+                    ok = save_labels_now()
+                    st.success("Edits applied" +
+                               (" and saved to disk ✓." if ok else "."))
                     st.rerun()
                 except Exception as e:
                     st.error(f"Could not apply edits: {e}")
@@ -501,7 +660,12 @@ is Negative TONE (galit) but Pro-Duterte STANCE. Label both columns independentl
 When unsure, choose Neutral + Undecided and note it in page 8.
 """)
         unlabeled = data[~data["manual_sentiment"].isin(EV.LABELS)].index.tolist()
-        st.markdown(f"Unlabeled remaining: **{len(unlabeled)}**")
+        n_lab = int(data["manual_sentiment"].isin(EV.LABELS).sum())
+        saved_at = st.session_state.get("labels_saved_at")
+        st.markdown(f"Unlabeled remaining: **{len(unlabeled)}** · "
+                    f"Labeled so far: **{n_lab}**" +
+                    (f" · saved to disk ✓ {saved_at}" if saved_at
+                     else " · not saved to disk yet"))
         idx = st.number_input("Row number to label", 0, max(0, len(data) - 1),
                               int(st.session_state.get("label_idx", 0) or 0))
         st.session_state["label_idx"] = int(idx)
@@ -513,19 +677,49 @@ When unsure, choose Neutral + Undecided and note it in page 8.
                 if st.button("👍 Positive"):
                     data.at[data.index[int(idx)], "manual_sentiment"] = "Positive"
                     st.session_state["df_raw"] = data
+                    for _k in ["dev_df", "hold_df", "cv_df", "final_res",
+                               "error_df"]:
+                        st.session_state[_k] = None
+                    st.session_state["stage_validation_done"] = False
+                    sync_labels_from_raw()
                     st.session_state["label_idx"] = min(int(idx) + 1, len(data) - 1)
+                    ok = save_labels_now()
+                    n_lab = int(data["manual_sentiment"].isin(EV.LABELS).sum())
+                    st.toast(f"Row {int(idx)} → Positive · {n_lab} labeled" +
+                             (" · saved ✓" if ok else " · NOT saved"),
+                             icon="🏷️")
                     st.rerun()
             with b2:
                 if st.button("👎 Negative"):
                     data.at[data.index[int(idx)], "manual_sentiment"] = "Negative"
                     st.session_state["df_raw"] = data
+                    for _k in ["dev_df", "hold_df", "cv_df", "final_res",
+                               "error_df"]:
+                        st.session_state[_k] = None
+                    st.session_state["stage_validation_done"] = False
+                    sync_labels_from_raw()
                     st.session_state["label_idx"] = min(int(idx) + 1, len(data) - 1)
+                    ok = save_labels_now()
+                    n_lab = int(data["manual_sentiment"].isin(EV.LABELS).sum())
+                    st.toast(f"Row {int(idx)} → Negative · {n_lab} labeled" +
+                             (" · saved ✓" if ok else " · NOT saved"),
+                             icon="🏷️")
                     st.rerun()
             with b3:
                 if st.button("😐 Neutral"):
                     data.at[data.index[int(idx)], "manual_sentiment"] = "Neutral"
                     st.session_state["df_raw"] = data
+                    for _k in ["dev_df", "hold_df", "cv_df", "final_res",
+                               "error_df"]:
+                        st.session_state[_k] = None
+                    st.session_state["stage_validation_done"] = False
+                    sync_labels_from_raw()
                     st.session_state["label_idx"] = min(int(idx) + 1, len(data) - 1)
+                    ok = save_labels_now()
+                    n_lab = int(data["manual_sentiment"].isin(EV.LABELS).sum())
+                    st.toast(f"Row {int(idx)} → Neutral · {n_lab} labeled" +
+                             (" · saved ✓" if ok else " · NOT saved"),
+                             icon="🏷️")
                     st.rerun()
             new_bloc = st.selectbox("Political bloc", DC.BLOCS,
                                     index=DC.BLOCS.index(row["political_bloc"])
@@ -533,6 +727,15 @@ When unsure, choose Neutral + Undecided and note it in page 8.
             if new_bloc != row["political_bloc"]:
                 data.at[data.index[int(idx)], "political_bloc"] = new_bloc
                 st.session_state["df_raw"] = data
+                for _k in ["dev_df", "hold_df", "cv_df", "final_res",
+                           "error_df"]:
+                    st.session_state[_k] = None
+                st.session_state["stage_validation_done"] = False
+                sync_labels_from_raw()
+                ok = save_labels_now()
+                st.toast(f"Row {int(idx)} bloc → {new_bloc}" +
+                         (" · saved ✓" if ok else " · NOT saved"),
+                         icon="🏷️")
                 st.rerun()
 
         # ---- Optional second annotator + kappa ----
@@ -544,7 +747,8 @@ When unsure, choose Neutral + Undecided and note it in page 8.
             a2_lab = st.selectbox("Annotator-2 label", EV.LABELS, key="a2_lab")
             if st.button("Save annotator-2 label"):
                 st.session_state["annotator2"][int(a2_idx)] = a2_lab
-                st.success("Saved.")
+                ok = save_labels_now()
+                st.success("Saved" + (" to disk ✓." if ok else "."))
             a2 = st.session_state.get("annotator2", {})
             if a2:
                 rows = sorted(set(a2) & set(
@@ -576,8 +780,8 @@ When unsure, choose Neutral + Undecided and note it in page 8.
 elif page == "preprocessing":
     what_to_do_box(
         "Preprocessing (Taglish)", [
-            "Tick cleaning options (emoji mapping, extra stopwords, minimum length).",
-            "Click **Run preprocessing** — read the before/after table row by row.",
+            "Results are already computed from raw_data.csv — read the before/after table row by row.",
+            "Tick cleaning options (emoji mapping, extra stopwords, minimum length) and Re-run to experiment.",
             "Check the funnel (records at each step) and the word-frequency chart.",
             "If everything vanished, loosen stopwords / lower minimum tokens and re-run.",
         ],
@@ -592,6 +796,13 @@ elif page == "preprocessing":
                 + " → repeats collapsed → slang normalized → "
                 + tooltip("tokenization", "Splitting text into countable word units.")
                 + " → stopwords removed → duplicates + short rows dropped.")
+    try:
+        st.caption(f"Stopwords source (external): {PP.stopwords_source()}. "
+                   "Negations/intensifiers are protected from removal. "
+                   "Transformer track additionally keeps `text_light` "
+                   "(URLs/mentions only) so BERT sees full context.")
+    except Exception:
+        pass
     data = df_raw()
     if data.empty:
         st.error("No data — collect or load data on page 2 first.")
@@ -606,11 +817,16 @@ elif page == "preprocessing":
                              label_visibility="collapsed")
     custom_list = [w.strip().lower() for w in custom_sw.split(",") if w.strip()]
     with st.expander("See default Filipino stopwords + slang map"):
-        st.markdown(f"Filipino stopwords ({len(PP.FILIPINO_STOPWORDS)}): "
-                    f"{', '.join(sorted(PP.FILIPINO_STOPWORDS))}")
+        try:
+            tl_words, tl_src = PP.get_tagalog_stopwords()
+            st.markdown(f"Tagalog stopwords ({len(tl_words)}, {tl_src}): "
+                        f"{', '.join(sorted(tl_words)[:60])} …")
+        except Exception:
+            st.markdown(f"Filipino stopwords ({len(PP.FILIPINO_STOPWORDS)}): "
+                        f"{', '.join(sorted(PP.FILIPINO_STOPWORDS))}")
         st.markdown("Slang sample: " + ", ".join(
-            f"{k}→{v}" for k, v in list(PP.TAGLISH_SLANG.items())[:20]) + " …")
-    if st.button("🧹 Run preprocessing"):
+            f"{k}→{v}" for k, v in list(PP.get_slang_map().items())[:20]) + " …")
+    if st.button("🧹 Re-run preprocessing (after changing options)"):
         try:
             clean, log, freq = PP.preprocess_dataframe(
                 data, custom_stopwords=custom_list, map_emojis=map_emo,
@@ -619,17 +835,20 @@ elif page == "preprocessing":
             st.session_state["freq_table"] = freq
             st.session_state["prep_log"] = log
             st.session_state["stage_preprocessing_done"] = True
+            invalidate_downstream_keep_clean()
             st.success(f"Kept {len(clean)} of {len(data)} rows.")
             st.rerun()
         except Exception as e:
             st.error(f"Preprocessing failed: {e}")
             st.stop()
     if st.session_state.get("df_clean") is None:
-        st.info("Click **Run preprocessing** to generate results.")
+        st.info("Preprocessing…")
         st.stop()
     clean = st.session_state["df_clean"]
     st.subheader("Before / after comparison")
-    st.dataframe(clean[["text", "clean_text", "n_tokens"]].head(20),
+    after_cols = [c for c in ["text", "clean_text", "text_light", "n_tokens"]
+                  if c in clean.columns]
+    st.dataframe(clean[after_cols].head(20),
                  use_container_width=True)
     st.subheader("Records at each step")
     st.dataframe(pd.DataFrame(st.session_state["prep_log"],
@@ -662,8 +881,7 @@ elif page == "preprocessing":
 elif page == "similarity":
     what_to_do_box(
         "Similarity Analysis", [
-            "Pick a grouping (platform / political bloc / source).",
-            "Click **Compute similarities**.",
+            "Pick a grouping (platform / political bloc / source) — results compute by themselves.",
             "Read the cosine heatmap first (overall framing), then Jaccard (strict overlap).",
             "Open shared vs distinctive words and quote 2–3 in your defense.",
         ],
@@ -683,24 +901,38 @@ elif page == "similarity":
     group_col = st.selectbox("Group comments by",
                              ["platform", "political_bloc", "source"])
     maxfeat = st.slider("TF-IDF vocabulary size", 500, 5000, 2000)
-    if st.button("🔍 Compute similarities"):
+    # Auto-compute on first visit (results ready on open); recompute only
+    # when the grouping/vocabulary changes or data changed. The distinctive
+    # dict is intentionally NOT persisted (see helpers), so its absence also
+    # triggers a (fast) recompute after a disk restore.
+    need_sim = (st.session_state.get("cos_df") is None or
+                not isinstance(st.session_state.get("distinctive"), dict) or
+                st.session_state.get("sim_group") != group_col or
+                st.session_state.get("sim_maxfeat") != maxfeat)
+    if need_sim:
         try:
-            _, _, _, cos_df = SIM.tfidf_cosine_matrix(clean, group_col,
-                                                      max_features=maxfeat)
-            jac_df = SIM.jaccard_matrix(clean, group_col)
-            shared, distinctive = SIM.top_shared_and_distinctive(clean, group_col)
+            with st.spinner("Computing similarities (fast)…"):
+                _, _, _, cos_df = SIM.tfidf_cosine_matrix(
+                    clean, group_col, max_features=maxfeat)
+                jac_df = SIM.jaccard_matrix(clean, group_col)
+                shared, distinctive = SIM.top_shared_and_distinctive(
+                    clean, group_col)
             st.session_state["cos_df"] = cos_df
             st.session_state["jac_df"] = jac_df
             st.session_state["shared_df"] = shared
             st.session_state["distinctive"] = distinctive
             st.session_state["sim_group"] = group_col
+            st.session_state["sim_maxfeat"] = maxfeat
             st.session_state["stage_similarity_done"] = True
-            st.rerun()
+            try:
+                save_state()
+            except Exception:
+                pass
         except Exception as e:
             st.error(f"Similarity failed: {e}\n\n{traceback.format_exc(limit=3)}")
             st.stop()
     if st.session_state.get("cos_df") is None:
-        st.info("Click **Compute similarities** to generate results.")
+        st.info("Similarity is computing…")
         st.stop()
     cos_df, jac_df = st.session_state["cos_df"], st.session_state["jac_df"]
     try:
@@ -723,13 +955,14 @@ elif page == "similarity":
         st.error(f"Heatmap failed: {e}")
         st.dataframe(cos_df); st.dataframe(jac_df)
     st.subheader("Pair badges (thresholds from sidebar)")
-    for a in cos_df.index:
-        for b in cos_df.columns:
-            if a < b:
-                lvl, sent = SIM.interpret_cosine(float(cos_df.loc[a, b]), TH)
+    _labels = [str(x) for x in cos_df.index]
+    for i, a in enumerate(_labels):
+        for j, b in enumerate(_labels):
+            if i < j:
+                lvl, sent = SIM.interpret_cosine(float(cos_df.iloc[i, j]), TH)
                 color = {"low": "red", "moderate": "yellow",
                          "high": "green"}[lvl]
-                render_badge(color, f"{a} vs {b}: cosine {cos_df.loc[a, b]:.2f}",
+                render_badge(color, f"{a} vs {b}: cosine {cos_df.iloc[i, j]:.2f}",
                              sent)
     st.subheader("Top shared words (in EVERY group)")
     st.dataframe(st.session_state["shared_df"], use_container_width=True)
@@ -747,9 +980,9 @@ elif page == "similarity":
 elif page == "topics":
     what_to_do_box(
         "Topic Modeling", [
-            "Choose LDA (default) or LSA; set topics with the slider for a first look.",
-            "Click **Auto-search k = 2..10** — the app plots Coherence + Perplexity and highlights the best k.",
+            "Topics train by themselves on first visit (k-search 2..10 runs once, then results are saved).",
             "Read top words + representative documents, then type your own label per topic.",
+            "Use the buttons only to re-train with a different method or k.",
             "Check topic share per platform before moving on.",
         ],
         "a best-k with green/yellow coherence, topics you can name confidently from examples, no two topics identical.",
@@ -774,25 +1007,34 @@ elif page == "topics":
     except Exception as e:
         st.error(str(e))
         st.stop()
-    if run_search:
-        with st.spinner("Training LDA for k=2..10 (this can take a minute)…"):
+    # Auto-run on first visit (no clicks needed); manual buttons re-run.
+    auto_topics = (st.session_state.get("topic_words") is None and
+                   method.startswith("LDA"))
+    if run_search or (auto_topics and st.session_state.get("k_table") is None):
+        msg = ("Training LDA for k=2..10 (first visit — a few minutes, "
+               "then saved for instant reopen)…"
+               if auto_topics and not run_search else
+               "Training LDA for k=2..10 (this can take a minute)…")
+        with st.spinner(msg):
             try:
                 kt = TOP.search_k(token_lists, 2, min(10, len(token_lists)))
                 st.session_state["k_table"] = kt
                 best = kt.loc[kt["coherence_cv"].idxmax()]
                 st.session_state["coherence_best"] = float(best["coherence_cv"])
                 k = int(best["k"])
-                st.success(f"Best k = {k} (Coherence {best['coherence_cv']:.3f}). "
-                           f"Training final model…")
             except Exception as e:
                 st.error(f"k-search failed: {e}")
                 st.stop()
-    if run_one or run_search:
+    if run_one or run_search or auto_topics:
         try:
             if method.startswith("LDA"):
-                kk = int(st.session_state["k_table"].loc[
-                    st.session_state["k_table"]["coherence_cv"].idxmax(), "k"]) \
-                    if (run_search and st.session_state.get("k_table") is not None) else k
+                if st.session_state.get("k_table") is not None and \
+                        (run_search or auto_topics):
+                    kk = int(st.session_state["k_table"].loc[
+                        st.session_state["k_table"]["coherence_cv"].idxmax(),
+                        "k"])
+                else:
+                    kk = k
                 model, dictionary, corpus = TOP.train_lda(token_lists, num_topics=kk)
                 mets = TOP.lda_metrics(model, token_lists, dictionary, corpus)
                 tw = TOP.top_words_per_topic(model)
@@ -817,11 +1059,22 @@ elif page == "topics":
                     topic_method="LSA", coherence_best=None,
                     topic_perplexity=None)
             st.session_state["stage_topics_done"] = True
+            try:
+                save_state()
+            except Exception:
+                pass
             st.rerun()
         except Exception as e:
             st.error(f"Topic training failed: {e}\n\n{traceback.format_exc(limit=3)}")
             st.stop()
     kt = st.session_state.get("k_table")
+    # CSV restore drops DataFrame attrs — re-stamp from the live backend.
+    if kt is not None and not kt.empty and \
+            "fallback" not in str(kt.attrs.get("coherence_metric", "")) and \
+            TOP.lda_backend() != "gensim":
+        kt.attrs["coherence_metric"] = \
+            "mean-NPMI fallback (no gensim; relative scale only)"
+        kt.attrs["lda_backend"] = TOP.lda_backend()
     if kt is not None and not kt.empty:
         st.subheader("k-search results (from YOUR data)")
         try:
@@ -839,7 +1092,11 @@ elif page == "topics":
                      use_container_width=True)
         best = kt.loc[kt["coherence_cv"].idxmax()]
         cv = float(best["coherence_cv"])
-        if cv < TH["coherence_red_max"]:
+        if "fallback" in str(kt.attrs.get("coherence_metric", "")):
+            render_badge("grey", f"Coherence {cv:.3f} (relative scale)",
+                         "gensim-free NPMI fallback — compare k values with "
+                         "each other, not with the C_V badges.")
+        elif cv < TH["coherence_red_max"]:
             render_badge("red", f"RED — Cv {cv:.3f}", "Topics may be hard to interpret.")
         elif cv <= TH["coherence_yellow_max"]:
             render_badge("yellow", f"YELLOW — Cv {cv:.3f}", "Usable; verify with example docs.")
@@ -864,7 +1121,16 @@ elif page == "topics":
             f"Topic {tid} [{words}]",
             value=st.session_state["topic_labels"].get(int(tid), f"Topic {tid}"))
     st.subheader("Representative documents (highest topic probability)")
-    for tid, rdf in st.session_state["topic_reps"].items():
+    # topic_reps is intentionally not persisted (dict of DataFrames); rebuild
+    # it cheaply from the persisted assignments after a disk restore.
+    if not isinstance(st.session_state.get("topic_reps"), dict) and \
+            st.session_state.get("topic_assign") is not None:
+        try:
+            st.session_state["topic_reps"] = TOP.representative_docs(
+                clean, st.session_state["topic_assign"])
+        except Exception:
+            pass
+    for tid, rdf in (st.session_state.get("topic_reps") or {}).items():
         label = st.session_state["topic_labels"].get(int(tid), f"Topic {tid}")
         with st.expander(f"Topic {tid} — {label}"):
             st.dataframe(rdf, use_container_width=True)
@@ -887,9 +1153,9 @@ elif page == "topics":
 elif page == "sentiment":
     what_to_do_box(
         "Sentiment Classifier", [
+            "Classification runs by itself on first visit — read distribution + net-sentiment bars.",
             "Review/edit the lexicon table (word → score in −2..+2); add Tagalog words your data actually uses.",
-            "Set Positive/Negative threshold sliders.",
-            "Click **Classify all comments**; read distribution + net-sentiment bars.",
+            "Set Positive/Negative threshold sliders, then Re-classify.",
             "If a side looks wrong, fix the LEXICON (not the results) and re-run.",
         ],
         "a predicted column for every row, net-sentiment bars per platform/bloc, and lexicon words you can defend one by one.",
@@ -907,6 +1173,9 @@ elif page == "sentiment":
     if clean is None or clean.empty:
         st.error("Run preprocessing (page 3) first.")
         st.stop()
+    # Labels may have been added on page 2 after these snapshots were made.
+    sync_labels_from_raw()
+    clean = st.session_state.get("df_clean")
     st.subheader("Editable lexicon (word → score −2..+2)")
     st.caption("Double-click a cell to edit. Positive = praise/support; "
                "negative = anger/fraud/condemnation wording.")
@@ -923,31 +1192,54 @@ elif page == "sentiment":
     if st.session_state["pos_thresh"] <= st.session_state["neg_thresh"]:
         st.error("Positive threshold must be ABOVE the negative threshold.")
         st.stop()
-    if st.button("💬 Classify all comments"):
+
+    def run_rule_classify(clean_df, lex_df, pt, nt):
+        """Classify with a lexicon table + thresholds; store results."""
+        lex = SEN.df_to_lexicon(lex_df)
+        st.session_state["lexicon_df"] = lex_df
+        st.session_state["lexicon"] = lex
+        sdf = SEN.classify_dataframe(clean_df, lex, pos_thresh=pt,
+                                     neg_thresh=nt)
+        # Attach topic names if topics were modeled.
+        if st.session_state.get("topic_assign") is not None and \
+                len(st.session_state["topic_assign"]) == len(sdf):
+            sdf["topic"] = [
+                st.session_state["topic_labels"].get(t, f"T{t}")
+                for t, _ in st.session_state["topic_assign"]]
+        st.session_state["sentiment_df"] = sdf
+        st.session_state["df_clean"] = sdf  # keep predictions downstream
+        st.session_state["stage_sentiment_done"] = True
         try:
-            lex = SEN.df_to_lexicon(lex_edited)
-            st.session_state["lexicon_df"] = lex_edited
-            st.session_state["lexicon"] = lex
-            sdf = SEN.classify_dataframe(clean, lex,
-                                         pos_thresh=st.session_state["pos_thresh"],
-                                         neg_thresh=st.session_state["neg_thresh"])
-            # Attach topic names if topics were modeled.
-            if st.session_state.get("topic_assign") is not None and \
-                    len(st.session_state["topic_assign"]) == len(sdf):
-                sdf["topic"] = [
-                    st.session_state["topic_labels"].get(t, f"T{t}")
-                    for t, _ in st.session_state["topic_assign"]]
-            st.session_state["sentiment_df"] = sdf
-            st.session_state["df_clean"] = sdf  # keep predictions downstream
-            st.session_state["stage_sentiment_done"] = True
-            st.success(f"Classified {len(sdf)} comments.")
+            save_state()
+        except Exception:
+            pass
+        return sdf
+
+    # Auto-classify on first visit (no clicks needed); the button re-runs
+    # after lexicon/threshold edits.
+    if st.session_state.get("sentiment_df") is None:
+        try:
+            with st.spinner("Classifying 2,347 comments (first visit only)…"):
+                run_rule_classify(clean, st.session_state["lexicon_df"],
+                                  float(st.session_state["pos_thresh"]),
+                                  float(st.session_state["neg_thresh"]))
+            st.rerun()
+        except Exception as e:
+            st.error(f"Classification failed: {e}")
+            st.stop()
+    if st.button("💬 Re-classify all comments (after lexicon/slider edits)"):
+        try:
+            run_rule_classify(clean, lex_edited,
+                              float(st.session_state["pos_thresh"]),
+                              float(st.session_state["neg_thresh"]))
+            st.success(f"Classified {len(st.session_state['sentiment_df'])} comments.")
             st.rerun()
         except Exception as e:
             st.error(f"Classification failed: {e}")
             st.stop()
     sdf = st.session_state.get("sentiment_df")
     if sdf is None:
-        st.info("Click **Classify all comments** to generate results.")
+        st.info("Classifying…")
         st.stop()
     st.subheader("Prediction distribution (your data)")
     dist = sdf["predicted"].value_counts().reindex(["Positive", "Negative",
@@ -989,7 +1281,109 @@ elif page == "sentiment":
                                  "manual_sentiment"]
                      if c in sdf.columns]
         st.dataframe(sdf[show_cols].head(50), use_container_width=True)
-    analysis_helper_box("Sentiment", SEN.sentiment_helper_bullets(sdf, TH))
+    analysis_helper_box("Sentiment (rule-based, graded)",
+                        SEN.sentiment_helper_bullets(sdf, TH))
+
+    # ---- Transformer comparison (auxiliary, GPU, cached) ----
+    st.divider()
+    st.subheader("🤖 Transformer comparison (auxiliary — not the graded model)")
+    st.caption("TagaSenti (XLM-R-large, Tagalog/Taglish) reads the raw wording "
+               "(`text_light`, stopwords kept) on your GPU. First run processes "
+               "and SAVES predictions to `saved_state/hf_cache/`; repeat runs "
+               "load the cache and skip the GPU entirely.")
+    try:
+        st.caption(f"Device: {SHF.device_detail()}")
+    except Exception:
+        pass
+    st.session_state["hf_model_id"] = st.text_input(
+        "HuggingFace model id",
+        value=str(st.session_state.get("hf_model_id",
+                                       HF_DEFAULTS["model_id"])),
+        help="Default jjjardev/tagasenti (Tagalog/Taglish 3-class). "
+             "Fallback: cardiffnlp/twitter-xlm-roberta-base-sentiment.")
+    st.session_state["hf_batch_size"] = st.slider(
+        "Batch size (RTX 4060 8GB handles 32 at 512 tokens)",
+        4, 64, int(st.session_state.get("hf_batch_size",
+                                        HF_DEFAULTS["batch_size"])))
+    if st.button("🚀 Run transformer comparison (GPU, cached)"):
+        try:
+            prog = st.progress(0.0, text="Loading model…")
+
+            def _cb(done, total):
+                try:
+                    prog.progress(min(1.0, done / max(1, total)),
+                                  text=f"Classifying {done}/{total}…")
+                except Exception:
+                    pass
+
+            with st.spinner("Transformer inference (first run is slow, "
+                            "cached runs are instant)…"):
+                hdf = SHF.classify_transformer_dataframe(
+                    st.session_state["df_clean"],
+                    model_id=str(st.session_state["hf_model_id"]),
+                    text_col="text_light"
+                    if "text_light" in st.session_state["df_clean"].columns
+                    else "text",
+                    batch_size=int(st.session_state["hf_batch_size"]),
+                    max_length=int(HF_DEFAULTS["max_length"]),
+                    cache_dir=str(HF_DEFAULTS["cache_dir"]),
+                    use_cache=True, progress_cb=_cb)
+            st.session_state["hf_df"] = hdf
+            st.session_state["hf_device"] = SHF.device_detail()
+            st.session_state["hf_fp"] = str(hdf["hf_fp"].iloc[0]) \
+                if "hf_fp" in hdf.columns else None
+            st.session_state["hf_cached"] = bool(hdf["hf_cached"].iloc[0]) \
+                if "hf_cached" in hdf.columns else None
+            prog.progress(1.0, text="Done.")
+            st.success(f"Transformer done on {len(hdf)} rows "
+                       f"({'disk cache' if st.session_state['hf_cached'] else 'fresh GPU run'}).")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Transformer failed: {e}")
+            st.stop()
+    hdf = st.session_state.get("hf_df")
+    if hdf is not None and not hdf.empty:
+        if st.session_state.get("hf_cached"):
+            st.info(f"⚡ Loaded from disk cache "
+                    f"(`saved_state/hf_cache/hf_preds_{st.session_state.get('hf_fp')}.csv`) "
+                    f"— GPU was NOT re-run.")
+        else:
+            st.info(f"💾 Fresh GPU run saved to disk "
+                    f"(`saved_state/hf_cache/hf_preds_{st.session_state.get('hf_fp')}.csv`). "
+                    "Next run with the same data + model loads instantly.")
+        hdist = hdf["predicted_hf"].value_counts().reindex(
+            ["Positive", "Negative", "Neutral"]).fillna(0)
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**Transformer distribution**")
+            st.dataframe(hdist.rename("n"), use_container_width=True)
+        with c2:
+            st.markdown("**Agreement: rule-based vs transformer**")
+            try:
+                base = st.session_state.get("sentiment_df")
+                if base is not None and "predicted" in base.columns and \
+                        len(base) == len(hdf):
+                    import pandas as pd
+                    agree = pd.crosstab(base["predicted"], hdf["predicted_hf"],
+                                        rownames=["rule-based"],
+                                        colnames=["transformer"])
+                    st.dataframe(agree, use_container_width=True)
+                    rate = (base["predicted"].values ==
+                            hdf["predicted_hf"].values).mean() * 100
+                    st.markdown(f"Agreement rate: **{rate:.1f}%**")
+            except Exception as e:
+                st.error(f"Agreement table failed: {e}")
+        with st.expander("Show transformer-scored rows"):
+            hcols = [c for c in ["text", "predicted_hf", "hf_label_raw",
+                                 "hf_confidence", "final_score_hf",
+                                 "score_explanation_hf", "manual_sentiment"]
+                     if c in hdf.columns]
+            st.dataframe(hdf[hcols].head(50), use_container_width=True)
+        analysis_helper_box("Sentiment (transformer comparison)",
+                            SHF.hf_helper_bullets(hdf))
+    else:
+        st.info("Optional: run the transformer comparison, or skip straight "
+                "to page 7 — the graded validation uses the rule-based model.")
 
 
 # ===========================================================================
@@ -1010,7 +1404,17 @@ elif page == "validation":
     st.header("7 · Validation & Evaluation (no leakage)")
     sdf = st.session_state.get("sentiment_df")
     if sdf is None or sdf.empty:
-        st.error("Run the sentiment classifier (page 6) first.")
+        st.error("Sentiment results are still computing — revisit in a moment.")
+        st.stop()
+    sync_labels_from_raw()
+    sdf = st.session_state.get("sentiment_df")
+    n_lab = int(sdf["manual_sentiment"].isin(EV.LABELS).sum()) \
+        if "manual_sentiment" in sdf.columns else 0
+    if n_lab < 15:
+        st.warning(f"⏳ Only **{n_lab}** human-labeled comments so far — validation "
+                   f"needs **15+** (aim **200+** for the report). Everything else in "
+                   f"this app is ready; go to **page 2's labeling tool** and grade a "
+                   f"stratified sample (mix of platforms), then return here.")
         st.stop()
     st.markdown("Protocol: **holdout BEFORE tuning → CV on dev → final eval ONCE.** "
                 "Thresholds/sliders may only be tuned on dev folds.")
@@ -1176,11 +1580,57 @@ elif page == "validation":
                     f"holdout comments misclassified. Reasons are heuristic guesses — "
                     f"read each row yourself.")
         st.dataframe(err, use_container_width=True)
-    analysis_helper_box("Evaluation", EV.evaluation_helper_bullets(
+    analysis_helper_box("Evaluation (rule-based, graded)", EV.evaluation_helper_bullets(
         fr, EV.cv_summary(st.session_state["cv_df"])
         if st.session_state.get("cv_df") is not None else pd.DataFrame(),
         st.session_state.get("cv_df"), len(st.session_state["hold_df"]),
         coh, TH))
+    # ---- Transformer holdout comparison (cache-once, metric-only) ----
+    st.divider()
+    st.subheader("🤖 Transformer on the same locked holdout (comparison)")
+    st.caption("No re-inference here: predictions are loaded from the page-6 "
+               "GPU run / disk cache and just graded on the locked holdout "
+               "(cache-once, metric-only — the slow reading happened once).")
+    hdf = st.session_state.get("hf_df")
+    if hdf is None or hdf.empty or "predicted_hf" not in hdf.columns:
+        st.info("Run the transformer comparison on page 6 first — then its "
+                "holdout numbers appear here.")
+    else:
+        try:
+            hold_ids = set(st.session_state["hold_df"]["id"].tolist()) \
+                if "id" in st.session_state["hold_df"].columns else set()
+            base = st.session_state.get("sentiment_df")
+            if hold_ids and base is not None and "id" in hdf.columns:
+                hh = hdf[hdf["id"].isin(hold_ids)].copy()
+            else:
+                # Fallback: align by position on labeled rows.
+                lab_all = hdf[hdf["manual_sentiment"].isin(EV.LABELS)].copy() \
+                    if "manual_sentiment" in hdf.columns else hdf.copy()
+                hh = lab_all.tail(len(st.session_state["hold_df"])).copy()
+            if hh.empty or "manual_sentiment" not in hh.columns:
+                st.warning("Transformer frame has no gold labels to grade — "
+                           "label comments first.")
+            else:
+                hres = EV.final_metrics(hh["manual_sentiment"].tolist(),
+                                        hh["predicted_hf"].tolist())
+                hc1, hc2, hc3 = st.columns(3)
+                with hc1:
+                    c, l, d = badge_for_metric(
+                        hres["accuracy"], "Transformer holdout accuracy.")
+                    render_badge(c, f"Accuracy: {l}", d)
+                with hc2:
+                    c, l, d = badge_for_metric(
+                        hres["macro_f1"], "Transformer holdout macro-F1.")
+                    render_badge(c, f"Macro-F1: {l}", d)
+                with hc3:
+                    st.markdown(f"**Rule-based:** acc {fr['accuracy']:.2f} / "
+                                f"F1 {fr['macro_f1']:.2f}  ·  "
+                                f"**Transformer:** acc {hres['accuracy']:.2f} / "
+                                f"F1 {hres['macro_f1']:.2f}")
+                st.markdown("**Transformer per-class report (holdout):**")
+                st.dataframe(hres["report_df"], use_container_width=True)
+        except Exception as e:
+            st.error(f"Transformer holdout grading failed: {e}")
 
 
 # ===========================================================================

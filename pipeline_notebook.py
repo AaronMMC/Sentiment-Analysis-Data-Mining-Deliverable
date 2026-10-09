@@ -18,8 +18,11 @@ exported dataset to reproduce your project results.
 
 # %% [markdown]
 # # Impeachment Discourse Pipeline (notebook version)
-# Steps: load → preprocess (Taglish) → similarity → topics (LDA) → sentiment → evaluation.
-# Replace INPUT_CSV with your real `impeachment_dataset.csv` export from the app.
+# Steps: load → preprocess (dual-track) → similarity → topics (LDA) →
+#   sentiment (rule-based GRADED + transformer comparison) → evaluation.
+# Table format for the report: each section below prints its output and the
+# remarks (helper bullets) right after — copy those into your
+# scripts/outputs/remarks table (Main_obj.md section E).
 
 # %% Imports
 import os
@@ -28,31 +31,41 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import pandas as pd
-from config import DEFAULT_THRESHOLDS as TH
+from config import DEFAULT_THRESHOLDS as TH, HF_DEFAULTS
 from modules import data_collection as DC
 from modules import preprocessing as PP
 from modules import similarity as SIM
 from modules import topics as TOP
 from modules import sentiment as SEN
+from modules import sentiment_hf as SHF
 from modules import evaluation as EV
 
-INPUT_CSV = "data/demo_sample.csv"   # <-- point at your real export for the defense
+INPUT_CSV = "data/raw_data.csv"   # webscraped dataset (~2751 rows)
 print("Python pipeline — thresholds:", {k: TH[k] for k in
       ["records_red_max", "coherence_yellow_max", "acc_yellow_max"]})
+print("Stopwords:", PP.stopwords_source())
+print("Transformer model:", HF_DEFAULTS["model_id"],
+      "| device:", SHF.device_detail())
 
 # %% 1. Load data
-df_raw = DC.load_demo_dataframe(INPUT_CSV)
+try:
+    df_raw = DC.load_raw_data_csv(INPUT_CSV)
+except FileNotFoundError:
+    df_raw = DC.load_demo_dataframe("data/demo_sample.csv")
+    print("WARNING: raw_data.csv not found — fell back to demo data.")
 print(f"Loaded {len(df_raw)} rows from {INPUT_CSV}")
 print(df_raw["platform"].value_counts())
 print(df_raw["manual_sentiment"].value_counts(dropna=False))
+print("NOTE: webscraped rows start unlabeled — label a stratified sample "
+      "(~300 rows) for validation; unsupervised steps use all rows.")
 
-# %% 2. Preprocess (Taglish)
+# %% 2. Preprocess (dual-track: clean_text for LDA, text_light for models)
 df_clean, log, freq = PP.preprocess_dataframe(df_raw, custom_stopwords=[],
                                               map_emojis=True, min_tokens=3)
 for step, n in log:
     print(f"{step}: {n}")
 print("\nBefore/after (first 5):")
-print(df_clean[["text", "clean_text"]].head())
+print(df_clean[["text", "clean_text", "text_light"]].head())
 print("\nTop 15 words:")
 print(freq.head(15))
 
@@ -86,7 +99,7 @@ print("\nHelper notes:")
 for b in TOP.topic_helper_bullets(k_table, TH):
     print("-", b)
 
-# %% 5. Sentiment (VADER + custom lexicon)
+# %% 5. Sentiment — rule-based (GRADED per Main_obj.md)
 lex = dict(SEN.DEFAULT_LEXICON)
 sdf = SEN.classify_dataframe(df_clean, lex, pos_thresh=0.15, neg_thresh=-0.15)
 print(sdf["predicted"].value_counts())
@@ -96,7 +109,27 @@ print("\nHelper notes:")
 for b in SEN.sentiment_helper_bullets(sdf, TH):
     print("-", b)
 
-# %% 6. Validation: holdout → 10-fold CV → final eval
+# %% 5b. Sentiment — transformer comparison (GPU, cached, NOT graded)
+# First run processes on GPU and SAVES to saved_state/hf_cache/; repeat runs
+# detect the existing cache file and load it (no GPU re-run).
+hdf = SHF.classify_transformer_dataframe(
+    df_clean, model_id=HF_DEFAULTS["model_id"], text_col="text_light",
+    batch_size=HF_DEFAULTS["batch_size"],
+    max_length=HF_DEFAULTS["max_length"],
+    cache_dir=HF_DEFAULTS["cache_dir"], use_cache=True)
+print("Cached run!" if bool(hdf["hf_cached"].iloc[0]) else "Fresh GPU run!")
+print(hdf["predicted_hf"].value_counts())
+print("\nAgreement (rule-based vs transformer):")
+print(pd.crosstab(sdf["predicted"], hdf["predicted_hf"],
+                  rownames=["rule-based"], colnames=["transformer"]))
+print("\nHelper notes:")
+for b in SHF.hf_helper_bullets(hdf):
+    print("-", b)
+
+# %% 6. Validation: holdout → 10-fold CV → final eval (GRADED: rule-based)
+# Rule-based CV re-classifies each fold (fast). Transformer uses cache-once:
+# predictions were computed ONCE above and saved; grading them per fold is
+# metric-only (no 10x GPU re-read). See app page 7 for the holdout comparison.
 lab = EV.labeled_only(sdf)
 dev, hold = EV.make_holdout(lab, holdout_frac=TH["holdout_frac"],
                             random_state=TH["random_state"])
@@ -124,5 +157,6 @@ for b in EV.evaluation_helper_bullets(final, EV.cv_summary(cv_df), cv_df,
     print("-", b)
 
 # %% Done
-print("\nDone. To reproduce with real data, set INPUT_CSV to your exported "
-      "impeachment_dataset.csv and re-run all cells.")
+print("\nDone. Rule-based numbers above are the graded results "
+      "(Main_obj.md: rule-based + 90/10 + 10-fold). Transformer §5b is the "
+      "auxiliary comparison (cached in saved_state/hf_cache/).")
