@@ -129,6 +129,23 @@ def auto_boot():
         except Exception as e:
             st.error(f"Could not auto-load data/raw_data.csv: {e}")
             return
+    # 2b. Merge committed hand labels (fresh clones / shared pulls).
+    # (Inline count: labeled_count() is defined further below.)
+    try:
+        _d = st.session_state.get("df_raw")
+        _before = int(_d["manual_sentiment"].isin(EV.LABELS).sum()) \
+            if isinstance(_d, pd.DataFrame) and "manual_sentiment" in _d.columns \
+            else 0
+        st.session_state["df_raw"] = DC.apply_gold_labels(
+            st.session_state.get("df_raw"))
+        _d2 = st.session_state.get("df_raw")
+        _after = int(_d2["manual_sentiment"].isin(EV.LABELS).sum()) \
+            if isinstance(_d2, pd.DataFrame) and "manual_sentiment" in _d2.columns \
+            else 0
+        if _after > _before:
+            st.session_state["stage_collection_done"] = True
+    except Exception:
+        pass
     # 3. Preprocess immediately (fast) so every page has results.
     if st.session_state.get("df_clean") is None and \
             isinstance(st.session_state.get("df_raw"), pd.DataFrame):
@@ -230,9 +247,17 @@ def labeled_count() -> int:
 
 
 def save_labels_now() -> bool:
-    """Persist the session to disk; stamp the time for visible proof."""
+    """Persist the session to disk; stamp the time for visible proof.
+
+    Also refreshes the committed gold-label file so hand labels travel
+    with git pushes and fresh clones.
+    """
     try:
         save_state()
+        try:
+            DC.write_gold_labels(st.session_state.get("df_raw"))
+        except Exception:
+            pass
         from datetime import datetime
         st.session_state["labels_saved_at"] = datetime.now().strftime(
             "%H:%M:%S")
