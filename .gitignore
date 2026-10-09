@@ -10,6 +10,9 @@ venv/
 saved_state/*
 !saved_state/.gitkeep
 
+# --- Pipeline run artifacts (regenerated via run; see PROJECT_GUIDE.md §10) ---
+outputs/
+
 # --- OS / editors ---
 .DS_Store
 Thumbs.db

@@ -14,6 +14,13 @@
 # - praw           -> Reddit API (read-only, respects rate limits)
 # - google-api-python-client -> YouTube Data API v3 (commentThreads.list)
 # - openpyxl       -> reading Excel uploads via pandas
+# - stopwordsiso   -> external Tagalog (tl) + English stopwords (stopwords-iso)
+# - transformers/torch/accelerate/safetensors -> AUXILIARY transformer
+#   comparison track only (TagaSenti, Tagalog/Taglish). The graded sentiment
+#   model stays rule-based (VADER + lexicon) per the project brief.
+#   GPU: install the CUDA build of torch for your card, e.g.
+#     py -m pip install torch --index-url https://download.pytorch.org/whl/cu121
+#   (RTX 4060 target). CPU fallback works without it, just slower.
 # bertopic is OPTIONAL (large download). The app runs fine without it.
 
 streamlit>=1.33
@@ -30,3 +37,8 @@ praw>=7.7
 google-api-python-client>=2.100
 openpyxl>=3.1
 scipy>=1.11
+stopwordsiso>=0.6
+transformers>=4.40
+accelerate>=0.30
+safetensors>=0.4
+torch>=2.2

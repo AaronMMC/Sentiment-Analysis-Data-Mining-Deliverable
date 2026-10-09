@@ -62,6 +62,16 @@ DEFAULT_THRESHOLDS = {
     "cv_folds": 10,              # 10-fold stratified CV
 }
 
+# Transformer comparison track (auxiliary — the graded model is rule-based).
+# TagaSenti = XLM-R-large finetuned on Tagalog/Taglish 3-class sentiment.
+HF_DEFAULTS = {
+    "model_id": "jjjardev/tagasenti",
+    "fallback_model_id": "cardiffnlp/twitter-xlm-roberta-base-sentiment",
+    "batch_size": 32,            # fits RTX 4060 8GB at 512 tokens (fp16)
+    "max_length": 512,           # HF truncation length
+    "cache_dir": "saved_state/hf_cache",
+}
+
 # Human-readable one-liners shown next to the threshold editor.
 THRESHOLD_HELP = {
     "records_red_max": "Fewer than this many records = red badge.",
