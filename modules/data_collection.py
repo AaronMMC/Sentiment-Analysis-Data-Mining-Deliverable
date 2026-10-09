@@ -21,6 +21,7 @@ Dataset schema (every row has these columns):
 import re
 import uuid
 from datetime import datetime
+from hashlib import sha1
 
 import pandas as pd
 
@@ -52,6 +53,11 @@ REQUIRED_COLUMNS = ["id", "platform", "source", "date", "text",
 # carry fresh labels into those frames by id after every labeling action.
 LABEL_COLUMNS = ["manual_sentiment", "political_bloc"]
 
+# Durable hand-label store (committed to git, unlike saved_state/). Exported
+# from the app on every save; merged back on boot so labels survive fresh
+# clones and shared pulls.
+GOLD_LABELS_PATH = "data/gold_labels.csv"
+
 
 def propagate_labels(df_raw: pd.DataFrame, df: pd.DataFrame) -> pd.DataFrame:
     """Copy gold labels from df_raw into a derived frame, matched by id.
@@ -77,6 +83,61 @@ def propagate_labels(df_raw: pd.DataFrame, df: pd.DataFrame) -> pd.DataFrame:
         [c for c in out.columns if c not in df.columns]
     return out[ordered]
 
+
+def load_gold_labels(path: str = GOLD_LABELS_PATH):
+    """Load the committed hand-label file; None if absent/unreadable."""
+    try:
+        gold = pd.read_csv(path)
+    except Exception:
+        return None
+    if gold is None or gold.empty or "id" not in gold.columns:
+        return None
+    cols = ["id"] + [c for c in LABEL_COLUMNS if c in gold.columns]
+    return gold[cols].drop_duplicates(subset=["id"])
+
+
+def apply_gold_labels(df_raw: pd.DataFrame,
+                      path: str = GOLD_LABELS_PATH) -> pd.DataFrame:
+    """Fill unlabeled rows of df_raw from the gold-label file (by id).
+
+    Only rows that are currently unlabeled are touched — in-session work is
+    never overwritten. Returns df_raw unchanged when no gold file exists.
+    """
+    gold = load_gold_labels(path)
+    if gold is None or df_raw is None or getattr(df_raw, "empty", True) \
+            or "id" not in df_raw.columns:
+        return df_raw
+    out = df_raw.copy()
+    if "manual_sentiment" not in out.columns:
+        out["manual_sentiment"] = ""
+    g = gold.set_index("id")
+    mask = ~out["manual_sentiment"].isin(SENTIMENTS)
+    idx = out[mask].set_index("id").index
+    hit = idx.intersection(g.index)
+    if len(hit):
+        out = out.set_index("id")
+        for col in [c for c in LABEL_COLUMNS if c in g.columns]:
+            out.loc[hit, col] = g.loc[hit, col].values
+        out = out.reset_index()
+    return out
+
+
+def write_gold_labels(df_raw: pd.DataFrame,
+                      path: str = GOLD_LABELS_PATH) -> int:
+    """Persist all currently labeled rows to the gold-label file.
+
+    Returns the number of labeled rows written (0 when there is nothing).
+    """
+    if df_raw is None or getattr(df_raw, "empty", True):
+        return 0
+    cols = ["id"] + [c for c in LABEL_COLUMNS if c in df_raw.columns]
+    lab = df_raw[df_raw["manual_sentiment"].isin(SENTIMENTS)][cols] \
+        .drop_duplicates(subset=["id"])
+    if lab.empty:
+        return 0
+    lab.to_csv(path, index=False)
+    return len(lab)
+
 # Extra metadata columns from webscrapes that we keep (not part of the core
 # schema, but useful for audit/export). coerce_schema() preserves these.
 EXTRA_COLUMNS = ["platform_raw", "post_url", "post_title", "post_author",
@@ -94,6 +155,17 @@ def load_demo_dataframe(path: str = "data/demo_sample.csv") -> pd.DataFrame:
         if col not in df.columns:
             df[col] = ""
     return df[REQUIRED_COLUMNS].copy()
+
+
+def stable_id(text: str) -> str:
+    """Deterministic 12-hex id from normalized comment text.
+
+    Random ids break cross-session joins (gold labels, saved restores):
+    every fresh load minted new ids for the same comments. Content hashes
+    are stable across loads, machines, and clones.
+    """
+    norm = re.sub(r"\s+", " ", str(text or "").strip().lower())
+    return sha1(norm.encode("utf-8", errors="ignore")).hexdigest()[:12]
 
 
 def normalize_platform(raw) -> str:
@@ -170,7 +242,6 @@ def load_raw_data_csv(path: str = "data/raw_data.csv") -> pd.DataFrame:
     for col in ["post_url", "post_title", "post_author", "username", "likes"]:
         if col in lower:
             out[col] = df[lower[col]]
-    out["id"] = [str(uuid.uuid4())[:8] for _ in range(len(out))]
     out["political_bloc"] = "Undecided/Neutral"
     out["manual_sentiment"] = ""
     out["text"] = out["text"].astype(str)
@@ -180,6 +251,9 @@ def load_raw_data_csv(path: str = "data/raw_data.csv") -> pd.DataFrame:
     out = out.drop_duplicates(subset=["__k"]).drop(columns=["__k"])
     out = out.reset_index(drop=True)
     out = anonymize_usernames(out)
+    # Stable content-hash ids (NOT random): the same comment must keep the
+    # same id on every load, or gold labels and saved restores can't join.
+    out["id"] = out["text"].apply(stable_id)
     # Order: core schema first, then extras that exist.
     extras = [c for c in EXTRA_COLUMNS if c in out.columns]
     out = out[REQUIRED_COLUMNS + extras]
