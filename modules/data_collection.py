@@ -30,8 +30,57 @@ PLATFORMS = ["YouTube", "Reddit", "Facebook (imported)", "X (imported)",
 BLOCS = ["Pro-Duterte", "Pro-Accountability", "Undecided/Neutral"]
 SENTIMENTS = ["Positive", "Negative", "Neutral"]
 
+# Raw webscrape values (lowercase, e.g. twitter/youtube/facebook) map to the
+# canonical PLATFORMS labels above so grouping/pages keep working.
+PLATFORM_MAP = {
+    "youtube": "YouTube",
+    "yt": "YouTube",
+    "reddit": "Reddit",
+    "facebook": "Facebook (imported)",
+    "fb": "Facebook (imported)",
+    "twitter": "X (imported)",
+    "x": "X (imported)",
+    "x (twitter)": "X (imported)",
+    "news": "News site (imported)",
+}
+
 REQUIRED_COLUMNS = ["id", "platform", "source", "date", "text",
                     "political_bloc", "manual_sentiment"]
+
+# Gold-label columns owned by the human annotator. Everything downstream
+# (df_clean, sentiment_df, hf_df) is a snapshot: use propagate_labels() to
+# carry fresh labels into those frames by id after every labeling action.
+LABEL_COLUMNS = ["manual_sentiment", "political_bloc"]
+
+
+def propagate_labels(df_raw: pd.DataFrame, df: pd.DataFrame) -> pd.DataFrame:
+    """Copy gold labels from df_raw into a derived frame, matched by id.
+
+    Left-join on 'id' so row order and row count of `df` never change;
+    predictions and all other columns are untouched. Rows whose id is
+    missing from df_raw keep their existing label values.
+    """
+    if df is None or getattr(df, "empty", True):
+        return df
+    if df_raw is None or getattr(df_raw, "empty", True):
+        return df
+    if "id" not in df.columns or "id" not in df_raw.columns:
+        return df
+    cols = [c for c in LABEL_COLUMNS if c in df_raw.columns]
+    if not cols:
+        return df
+    lab = df_raw[["id"] + cols].drop_duplicates(subset=["id"])
+    keep = [c for c in df.columns if c not in cols]
+    out = df[keep].merge(lab, on="id", how="left")
+    # Restore original column order where possible.
+    ordered = [c for c in df.columns if c in out.columns] + \
+        [c for c in out.columns if c not in df.columns]
+    return out[ordered]
+
+# Extra metadata columns from webscrapes that we keep (not part of the core
+# schema, but useful for audit/export). coerce_schema() preserves these.
+EXTRA_COLUMNS = ["platform_raw", "post_url", "post_title", "post_author",
+                 "username", "likes", "timestamp"]
 
 
 # ---------------------------------------------------------------------------
@@ -45,6 +94,98 @@ def load_demo_dataframe(path: str = "data/demo_sample.csv") -> pd.DataFrame:
         if col not in df.columns:
             df[col] = ""
     return df[REQUIRED_COLUMNS].copy()
+
+
+def normalize_platform(raw) -> str:
+    """Map a raw platform string to a canonical PLATFORMS label."""
+    s = str(raw or "").strip()
+    if s in PLATFORMS:
+        return s
+    key = s.lower().strip()
+    if key in PLATFORM_MAP:
+        return PLATFORM_MAP[key]
+    # Tolerate variants like "X (Twitter)" / "Facebook".
+    for k, v in PLATFORM_MAP.items():
+        if k in key or key in k:
+            return v
+    return "Other"
+
+
+def load_raw_data_csv(path: str = "data/raw_data.csv") -> pd.DataFrame:
+    """Load the webscraped dataset into the core schema (dual-track ready).
+
+    Expected raw columns (all optional except the text one):
+      source, platform, post_url, post_title, post_author, comment_text,
+      username, likes, timestamp
+
+    Mapping:
+      comment_text -> text (raw, untouched — transformer track uses this)
+      platform     -> canonical platform label (platform_raw kept as-is)
+      timestamp    -> date (parsed, fallback = today)
+      post_url/post_title/source -> source
+      id/political_bloc/manual_sentiment filled with defaults for labeling.
+
+    Keeps EXTRA_COLUMNS metadata alongside the core schema. De-duplicates on
+    normalized text. Raises a helpful error if no text column is found.
+    """
+    df = pd.read_csv(path)
+    lower = {str(c).lower(): c for c in df.columns}
+    text_col = next((lower[c] for c in
+                     ["comment_text", "text", "comment", "content", "message",
+                      "body"] if c in lower), None)
+    if text_col is None:
+        raise ValueError(
+            f"No text column in {path} (looked for comment_text/text/comment). "
+            f"Found columns: {list(df.columns)}")
+    n_in = len(df)
+    out = pd.DataFrame()
+    out["text"] = df[text_col].astype(str)
+    plat_raw = df[lower["platform"]].astype(str) if "platform" in lower \
+        else df[lower["source"]].astype(str) if "source" in lower else "Other"
+    out["platform_raw"] = plat_raw.astype(str)
+    out["platform"] = plat_raw.apply(normalize_platform)
+    if "timestamp" in lower:
+        parsed = pd.to_datetime(df[lower["timestamp"]], utc=True,
+                                errors="coerce")
+        out["date"] = parsed.dt.strftime("%Y-%m-%d").fillna(
+            datetime.now().strftime("%Y-%m-%d"))
+        out["timestamp"] = df[lower["timestamp"]].astype(str)
+    elif "date" in lower:
+        out["date"] = pd.to_datetime(df[lower["date"]], errors="coerce") \
+            .dt.strftime("%Y-%m-%d").fillna(
+                datetime.now().strftime("%Y-%m-%d"))
+    else:
+        out["date"] = datetime.now().strftime("%Y-%m-%d")
+    # Source: prefer post_url, else post_title, else source column.
+    if "post_url" in lower:
+        out["source"] = df[lower["post_url"]].astype(str)
+    elif "post_title" in lower:
+        out["source"] = df[lower["post_title"]].astype(str).str.slice(0, 80)
+    elif "source" in lower:
+        out["source"] = df[lower["source"]].astype(str)
+    else:
+        out["source"] = "raw_data.csv"
+    out.loc[out["source"].str.strip().isin(["", "nan", "None"]), "source"] = \
+        "raw_data.csv"
+    for col in ["post_url", "post_title", "post_author", "username", "likes"]:
+        if col in lower:
+            out[col] = df[lower[col]]
+    out["id"] = [str(uuid.uuid4())[:8] for _ in range(len(out))]
+    out["political_bloc"] = "Undecided/Neutral"
+    out["manual_sentiment"] = ""
+    out["text"] = out["text"].astype(str)
+    out = out[out["text"].str.strip().ne("")].copy()
+    # Drop exact-duplicate comment texts (keep first occurrence).
+    out["__k"] = out["text"].str.strip().str.lower()
+    out = out.drop_duplicates(subset=["__k"]).drop(columns=["__k"])
+    out = out.reset_index(drop=True)
+    out = anonymize_usernames(out)
+    # Order: core schema first, then extras that exist.
+    extras = [c for c in EXTRA_COLUMNS if c in out.columns]
+    out = out[REQUIRED_COLUMNS + extras]
+    print(f"load_raw_data_csv: {n_in} raw rows -> {len(out)} kept "
+          f"({out['platform'].value_counts().to_dict()})")
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -82,9 +223,11 @@ def coerce_schema(df: pd.DataFrame, default_platform="Other",
     rename_map = {}
     lower = {c.lower(): c for c in df.columns}
     candidates = {
-        "text": ["text", "comment", "content", "message", "body"],
+        "text": ["text", "comment_text", "comment", "content", "message",
+                 "body"],
         "platform": ["platform", "site", "source_site"],
-        "source": ["source", "video", "video_title", "thread", "url", "post"],
+        "source": ["source", "video", "video_title", "thread", "url",
+                   "post", "post_url", "post_title"],
         "date": ["date", "created", "created_at", "published", "timestamp"],
         "political_bloc": ["political_bloc", "bloc", "camp", "stance"],
         "manual_sentiment": ["manual_sentiment", "sentiment", "label",
@@ -101,12 +244,24 @@ def coerce_schema(df: pd.DataFrame, default_platform="Other",
         df["id"] = [str(uuid.uuid4())[:8] for _ in range(len(df))]
     if "platform" not in df.columns:
         df["platform"] = default_platform
+    else:
+        df["platform"] = df["platform"].apply(normalize_platform)
+    if "platform_raw" not in df.columns:
+        df["platform_raw"] = df["platform"].astype(str)
     if "source" not in df.columns:
         df["source"] = default_source
     if "date" not in df.columns:
         df["date"] = datetime.now().strftime("%Y-%m-%d")
+    else:
+        df["date"] = pd.to_datetime(df["date"], utc=True,
+                                     errors="coerce").dt.strftime("%Y-%m-%d") \
+            .fillna(datetime.now().strftime("%Y-%m-%d"))
     if "text" not in df.columns:
         raise ValueError("Upload has no recognizable text/comment column.")
+    if "comment_text" in df.columns and df["text"].astype(str).str.strip().eq("").any():
+        # Prefer webscrape comment_text when the mapped text is blank.
+        blank = df["text"].astype(str).str.strip() == ""
+        df.loc[blank, "text"] = df.loc[blank, "comment_text"].astype(str)
     if "political_bloc" not in df.columns:
         df["political_bloc"] = "Undecided/Neutral"
     if "manual_sentiment" not in df.columns:
@@ -120,7 +275,10 @@ def coerce_schema(df: pd.DataFrame, default_platform="Other",
     df.loc[~df["manual_sentiment"].isin(valid_sent), "manual_sentiment"] = ""
     df["text"] = df["text"].astype(str)
     df = df[df["text"].str.strip() != ""].reset_index(drop=True)
-    return anonymize_usernames(df[REQUIRED_COLUMNS])
+    df = anonymize_usernames(df)
+    extras = [c for c in EXTRA_COLUMNS if c in df.columns]
+    keep = REQUIRED_COLUMNS + extras
+    return df[[c for c in keep if c in df.columns]]
 
 
 def parse_manual_paste(raw_text: str, platform: str,
